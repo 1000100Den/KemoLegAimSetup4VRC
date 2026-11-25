@@ -1,3 +1,4 @@
+using System;
 using UnityEngine;
 using VRC.Dynamics;
 using VRC.SDK3.Dynamics.Constraint.Components;
@@ -79,8 +80,12 @@ namespace Paratap.KemoLegAim.Editor
                     var constraint = dummyBone.gameObject.AddComponent<VRCAimConstraint>();
                     constraint.WorldUp = VRCConstraintBase.WorldUpType.ObjectUp;
                     if (hips != null) constraint.WorldUpTransform = hips;
-                    // TODO 実地確認: AimAxis / UpAxis は元手順で変更しないため既定値のままにしている。
-                    //   既定値が元手順の Inspector 初期状態と一致するか、実プロジェクトで確認すること。
+                    // Aim / Up Vector は手動セットアップの実測値（2026-11-26）に合わせる。
+                    // Aim は全部位 (0,0,1)。Up は LowerLeg のみ (0,0,1)、他は (0,1,0)。
+                    constraint.AimAxis = new Vector3(0f, 0f, 1f);
+                    constraint.UpAxis = part == LegPart.LowerLeg
+                        ? new Vector3(0f, 0f, 1f)
+                        : new Vector3(0f, 1f, 0f);
 
 #if KEMOLEG_SDK_3_10_6_OR_NEWER
                     constraint.AddSource(new VRCConstraintSource(target.transform, 1.0f));
@@ -92,14 +97,65 @@ namespace Paratap.KemoLegAim.Editor
                     constraint.Sources.Add(new VRCConstraintSource(target.transform, 1.0f));
 #endif
 
-                    // TODO 実地確認: ActivateConstraint() と ApplyConfigurationChanges() の
-                    //   正しい呼び出し順序は調査で未確定。ここでは公式 API ページの
-                    //   元手順対応表の並び（Activate → 仕上げに Apply）に倣っている。
-                    //   実プロジェクトで逆順との差異を検証すること。
-                    constraint.ActivateConstraint();
+                    // ---- At Rest / Offset の確定（v0.3.0）----
+                    // v0.2.0 ではクローン側の RotationAtRest / RotationOffset が
+                    // (0,0,0) のまま固定され、Play で姿勢が崩れた（2026-11-26 実測）。
+                    // 原因の見立て: ActivateConstraint() のキャプチャは「適用済みの」
+                    // 構成（Source 等）を前提とするが、v0.2.0 は ApplyConfigurationChanges()
+                    // より前に呼んでいたため、Source 未適用の状態でキャプチャされ
+                    // 既定値のままになった。
+                    // 対策:
+                    // 1) RotationAtRest は定義どおり「Weight 0 のときのローカル回転」
+                    //    なので、レストポーズのボーンのローカル回転を明示設定する。
+                    // 2) 順序を ApplyConfigurationChanges() → ActivateConstraint() に変更し、
+                    //    Source が適用された状態で Offset をキャプチャさせる。
+                    // 3) それでも Offset が (0,0,0) のままなら、自前計算した値で補う。
+                    constraint.RotationAtRest = dummyBone.localRotation.eulerAngles;
                     constraint.ApplyConfigurationChanges();
+                    constraint.ActivateConstraint();
+
+                    if (constraint.RotationOffset == Vector3.zero)
+                    {
+                        constraint.RotationOffset = ComputeAimOffset(
+                            dummyBone, target.transform,
+                            constraint.AimAxis, constraint.UpAxis, hips).eulerAngles;
+                        constraint.ApplyConfigurationChanges();
+                        Debug.LogWarning(
+                            $"[KemoLegAim] {BoneAutoDetector.SideLabel(side)} {BoneAutoDetector.PartLabel(part)}: " +
+                            "ActivateConstraint で RotationOffset がキャプチャされなかったため、計算値で補いました。", setup);
+                    }
                 }
             }
+        }
+
+        /// <summary>
+        /// レストポーズで「現在のボーンのワールド回転」と一致する結果になる Aim の
+        /// RotationOffset（ワールド空間）を計算する。ソルバの合成を
+        /// final = aimWorld * offset とみなし、offset = inverse(aimWorld) * currentWorld
+        /// とする（Activate 時のキャプチャと同じ考え方）。
+        /// aimWorld は、AimAxis がボーン→ターゲット方向を向き、UpAxis がワールドアップ
+        /// （ObjectUp の場合は Hips の up）に合う回転として LookRotation で構成する。
+        /// AimAxis と UpAxis が平行な部位（LowerLeg）では基準基底が定まらないため、
+        /// UpAxis と平行でない軸を代用する（この場合のロール方向は近似になる）。
+        /// </summary>
+        private static Quaternion ComputeAimOffset(Transform bone, Transform target, Vector3 aimAxis, Vector3 upAxis, Transform worldUpObject)
+        {
+            var dir = target.position - bone.position;
+            if (dir.sqrMagnitude < 1e-12f) return Quaternion.identity;
+            dir.Normalize();
+
+            var worldUp = worldUpObject != null ? worldUpObject.up : Vector3.up;
+
+            var basisUp = upAxis;
+            if (Vector3.Cross(aimAxis, basisUp).sqrMagnitude < 1e-8f)
+            {
+                basisUp = Math.Abs(aimAxis.y) < 0.9f ? Vector3.up : Vector3.right;
+            }
+
+            var baseAim = Quaternion.LookRotation(aimAxis, basisUp);
+            var targetAim = Quaternion.LookRotation(dir, worldUp);
+            var aimWorld = targetAim * Quaternion.Inverse(baseAim);
+            return Quaternion.Inverse(aimWorld) * bone.rotation;
         }
 
         private static LegChain FillTrackingFromHumanoid(LegChain fieldChain, Animator animator, LegSide side)
