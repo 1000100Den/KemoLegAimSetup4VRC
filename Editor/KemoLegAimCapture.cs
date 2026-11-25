@@ -1,11 +1,12 @@
 using System.Collections.Generic;
+using System.Text;
 using UnityEditor;
 using UnityEngine;
 
 namespace Paratap.KemoLegAim.Editor
 {
     /// <summary>
-    /// At Rest / Offset の事前キャプチャ（v0.4.0）。
+    /// At Rest / Offset の事前キャプチャ（v0.4.0、v0.4.1 で診断強化）。
     ///
     /// 背景: VRCAimConstraint の RotationAtRest / RotationOffset は、手動セットアップ
     /// では「未ロック＋有効な Constraint がエディタ上で再計算を繰り返す」ことで
@@ -15,12 +16,20 @@ namespace Paratap.KemoLegAim.Editor
     ///
     /// 本クラスは手動セットアップと同じ条件をエディタ上で再現する:
     /// アバターの一時クローンを作り、KemoLegAimBuilder.CreateAll でターゲットと
-    /// 未ロックの Constraint を生成し、数フレーム待って SDK のエディタ上
-    /// Constraint 実行に再計算させ、確定した At Rest / Offset を元の
-    /// KemoLegAimSetup へ保存する。クローンは読み取り後に破棄する。
+    /// 未ロックの Constraint を生成し、SDK のエディタ上 Constraint 実行に
+    /// 再計算させ、確定した At Rest / Offset を元の KemoLegAimSetup へ保存する。
+    /// クローンは読み取り後に破棄する。
+    ///
+    /// v0.4.0 では「再計算が起きて値が安定する」ことだけを待ったがタイムアウトした
+    /// ため、v0.4.1 では以下を追加した:
+    /// - 経過と現在値の定期ログ（再計算が起きているかどうかを Console で判別可能に）
+    /// - 一時クローンを Hierarchy で選択し、Scene ビューの再描画も促す
+    /// - 値が非ゼロのまま安定しない場合、および後半になっても (0,0,0) の場合に、
+    ///   エディタ文脈での ActivateConstraint() を試す（Inspector の Activate ボタン
+    ///   相当のキャプチャがエディタ上では働く可能性に賭ける）
     ///
     /// 前提: SDK Control Panel の「Execute VRChat Constraints in Edit Mode」が
-    /// 有効であること。無効だと再計算が走らず、タイムアウトとして検出する。
+    /// 有効であること。
     /// </summary>
     public static class KemoLegAimCapture
     {
@@ -32,10 +41,14 @@ namespace Paratap.KemoLegAim.Editor
         private static GameObject _clone;
         private static List<CreatedConstraint> _created;
         private static double _startTime;
+        private static double _lastLogTime;
+        private static double _firstNonZeroTime = -1;
+        private static bool _activateTried;
         private static Dictionary<CreatedConstraint, Vector3> _lastOffsets;
         private static int _stableCount;
 
-        private const double TimeoutSeconds = 20.0;
+        private const double TimeoutSeconds = 30.0;
+        private const double ActivateTrySeconds = 10.0;
 
         public static void Begin(KemoLegAimSetup setup)
         {
@@ -68,6 +81,8 @@ namespace Paratap.KemoLegAim.Editor
 
             _clone = Object.Instantiate(avatarRoot);
             _clone.name = avatarRoot.name + " (KemoLegAim Capture)";
+            // エディタ側の Constraint 処理が選択中のアバターを対象とする場合に備える
+            Selection.activeGameObject = _clone;
 
             var cloneSetup = _clone.GetComponentInChildren<KemoLegAimSetup>();
             if (cloneSetup == null)
@@ -86,9 +101,13 @@ namespace Paratap.KemoLegAim.Editor
             _sourceSetup = setup;
             _lastOffsets = new Dictionary<CreatedConstraint, Vector3>();
             _stableCount = 0;
+            _firstNonZeroTime = -1;
+            _activateTried = false;
             _startTime = EditorApplication.timeSinceStartup;
+            _lastLogTime = _startTime;
             IsRunning = true;
-            LastMessage = "キャプチャ中…（一時クローン上で Constraint の再計算を待っています）";
+            LastMessage = "キャプチャ中…（一時クローン上で Constraint の再計算を待っています。Console に経過が出ます）";
+            Debug.Log($"[KemoLegAim] キャプチャ開始: Constraint {_created.Count} 個を一時クローンに生成しました。", setup);
             EditorApplication.update += OnEditorUpdate;
         }
 
@@ -106,8 +125,11 @@ namespace Paratap.KemoLegAim.Editor
             }
 
             EditorApplication.QueuePlayerLoopUpdate();
+            SceneView.RepaintAll();
 
-            // 全 Constraint の Offset が (0,0,0) でなくなり、かつ値が安定したら確定。
+            double now = EditorApplication.timeSinceStartup;
+            double elapsed = now - _startTime;
+
             bool allNonZero = true;
             bool stable = true;
             foreach (var c in _created)
@@ -120,6 +142,15 @@ namespace Paratap.KemoLegAim.Editor
                     stable = false;
                 }
                 _lastOffsets[c] = offset;
+            }
+
+            if (allNonZero && _firstNonZeroTime < 0) _firstNonZeroTime = now;
+
+            // 定期ログ（再計算が起きているかの切り分け用）
+            if (now - _lastLogTime >= 5.0)
+            {
+                _lastLogTime = now;
+                Debug.Log($"[KemoLegAim] キャプチャ経過 {elapsed:F0} 秒: {DescribeOffsets()}");
             }
 
             if (allNonZero && stable)
@@ -136,12 +167,42 @@ namespace Paratap.KemoLegAim.Editor
                 _stableCount = 0;
             }
 
-            if (EditorApplication.timeSinceStartup - _startTime > TimeoutSeconds)
+            // ActivateConstraint のエディタ文脈キャプチャを試す条件:
+            // - 値が非ゼロになったのに 5 秒安定しない（再計算は起きているが揺れる）
+            // - 開始から ActivateTrySeconds 経っても (0,0,0) のまま（受動的な再計算が起きない）
+            if (!_activateTried &&
+                ((_firstNonZeroTime > 0 && now - _firstNonZeroTime > 5.0) ||
+                 elapsed > ActivateTrySeconds))
             {
-                Fail("タイムアウト: Constraint の再計算が確認できませんでした。" +
-                     "VRChat SDK Control Panel の Settings で「Execute VRChat Constraints in Edit Mode」が" +
-                     "有効になっているか確認してください。");
+                _activateTried = true;
+                Debug.Log("[KemoLegAim] ActivateConstraint によるキャプチャを試します。");
+                foreach (var c in _created)
+                {
+                    c.Constraint.ApplyConfigurationChanges();
+                    c.Constraint.ActivateConstraint();
+                }
+                // ロック後は値が固定されるため、次の安定判定で確定できる
+                _lastOffsets.Clear();
+                _stableCount = 0;
             }
+
+            if (elapsed > TimeoutSeconds)
+            {
+                Fail($"タイムアウト（{TimeoutSeconds:F0} 秒）。最後の Offset 値: {DescribeOffsets()} " +
+                     "SDK Control Panel の「Execute VRChat Constraints in Edit Mode」が有効か、" +
+                     "この経過ログと合わせて確認してください。");
+            }
+        }
+
+        private static string DescribeOffsets()
+        {
+            var sb = new StringBuilder();
+            foreach (var c in _created)
+            {
+                if (sb.Length > 0) sb.Append(" / ");
+                sb.Append($"{BoneAutoDetector.SideLabel(c.Side)} {BoneAutoDetector.PartLabel(c.Part)}: {c.Constraint.RotationOffset}");
+            }
+            return sb.ToString();
         }
 
         private static void Succeed()
@@ -187,6 +248,8 @@ namespace Paratap.KemoLegAim.Editor
             _sourceSetup = null;
             _lastOffsets = null;
             _stableCount = 0;
+            _firstNonZeroTime = -1;
+            _activateTried = false;
         }
     }
 }
