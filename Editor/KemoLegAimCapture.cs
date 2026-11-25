@@ -6,28 +6,37 @@ using UnityEngine;
 namespace Paratap.KemoLegAim.Editor
 {
     /// <summary>
-    /// At Rest / Offset の事前キャプチャ（v0.4.0、v0.5.0 で段階式に変更）。
+    /// At Rest / Offset の事前キャプチャ（v0.4.0、v0.5.0 で段階式、v0.5.1 で読み取り順序を修正）。
     ///
     /// 背景: VRCAimConstraint の RotationAtRest / RotationOffset は、手動セットアップ
-    /// では「未ロック＋有効な Constraint がエディタ上で再計算を繰り返す」ことで
-    /// 値が決まり、Activate（ロック）で固定される。ビルド時に生成した
-    /// コンポーネントではその再計算が走らず、ActivateConstraint() もキャプチャを
+    /// ではエディタ上で値が決まり、Activate（ロック）で固定される。ビルド時に生成した
+    /// コンポーネントではその過程が走らず、ActivateConstraint() もキャプチャを
     /// 行わないため、値は既定値 (0,0,0) のままになる（v0.2.0〜v0.3.0 で実測）。
     ///
-    /// v0.4.1 の一斉キャプチャでは UpperLeg は手動値と一致したが、LowerLeg 以下が
-    /// 一致しなかった（2026-11-26 実測）。原因は、手動セットアップでは上位の
-    /// Constraint が有効化され脚を駆動した状態で下位を設定するのに対し、
-    /// 一斉キャプチャでは全て未駆動の状態で値を取っていたこと。
+    /// 実測から分かったこと:
+    /// - 未ロック時の「再計算」で得られる値は、上位が駆動していない状態の値
+    ///   （v0.4.1: UpperLeg は手動値と一致、LowerLeg 以下は不一致）。
+    /// - 手動セットアップの値は、Activate を押した時点で、その時点の
+    ///   （上位が駆動した）姿勢から確定した値とみられる。v0.5.0 の段階式では
+    ///   ロック前に読んだ再計算値を採用したため、結果が一斉キャプチャと
+    ///   同じになってしまった。
     ///
-    /// v0.5.0 では手動セットアップの手順をそのまま再現する段階式にした:
-    /// 一時クローン上に全 Constraint を未ロックで生成し、
-    /// UpperLeg → LowerLeg → Foot の順に「再計算が安定するまで待つ → 値を読み、
-    /// その Constraint をロック（駆動開始）」を繰り返す。
-    /// 下位の再計算は上位が駆動した状態で行われるため、手動値と一致する。
+    /// v0.5.1 の手順（手動セットアップの再現）:
+    /// 一時クローン上に全 Constraint を未ロックで生成し、UpperLeg → LowerLeg →
+    /// Foot の順に、各段階で
+    ///   1) 再計算値が非ゼロで安定するのを待つ
+    ///   2) ActivateConstraint() でロックする（エディタ文脈では、この時点で
+    ///      現在の姿勢から値が確定し直す可能性がある）
+    ///   3) 数フレーム置いてから、ロック後の値を読み取って結果とする
+    /// を繰り返す。下位の段階では上位が駆動した状態になっている。
     /// 確定値は元の KemoLegAimSetup へ保存し、クローンは破棄する。
     ///
     /// 前提: SDK Control Panel の「Execute VRChat Constraints in Edit Mode」が
-    /// 有効であること。
+    /// 有効であること。また手動セットアップの実態として、Activate 後に
+    /// AIMTARGET 位置を目視調整している（2026-11-26 本人確認）。そのため
+    /// 手動値そのものは「Activate 時点のターゲット位置」で決まっており、
+    /// 現在のターゲット位置から厳密に再現できるとは限らない。本キャプチャは
+    /// 現在のターゲット位置で Activate した場合の値を取る。
     /// </summary>
     public static class KemoLegAimCapture
     {
@@ -41,15 +50,16 @@ namespace Paratap.KemoLegAim.Editor
         private static int _stageIndex;
         private static double _stageStartTime;
         private static double _lastLogTime;
-        private static bool _activateTriedInStage;
         private static Dictionary<CreatedConstraint, Vector3> _lastOffsets;
         private static int _stableCount;
+        private static int _lockFramesLeft = -1;
         private static readonly Dictionary<(LegSide, LegPart), (Vector3 AtRest, Vector3 Offset)> _results =
             new Dictionary<(LegSide, LegPart), (Vector3, Vector3)>();
 
         private const double StageTimeoutSeconds = 30.0;
         private const double ActivateTrySeconds = 12.0;
         private const double MinStageSeconds = 2.0;
+        private const int LockSettleFrames = 5;
 
         public static void Begin(KemoLegAimSetup setup)
         {
@@ -112,12 +122,12 @@ namespace Paratap.KemoLegAim.Editor
             _stageIndex = 0;
             _lastOffsets = new Dictionary<CreatedConstraint, Vector3>();
             _stableCount = 0;
-            _activateTriedInStage = false;
+            _lockFramesLeft = -1;
             _stageStartTime = EditorApplication.timeSinceStartup;
             _lastLogTime = _stageStartTime;
             IsRunning = true;
             LastMessage = "キャプチャ中…（UpperLeg から順に再計算を待っています。Console に経過が出ます）";
-            Debug.Log($"[KemoLegAim] キャプチャ開始（段階式）: Constraint {created.Count} 個を一時クローンに生成しました。", setup);
+            Debug.Log($"[KemoLegAim] キャプチャ開始（段階式 v0.5.1）: Constraint {created.Count} 個を一時クローンに生成しました。", setup);
             EditorApplication.update += OnEditorUpdate;
         }
 
@@ -143,6 +153,17 @@ namespace Paratap.KemoLegAim.Editor
             double now = EditorApplication.timeSinceStartup;
             double stageElapsed = now - _stageStartTime;
             var stage = CurrentStage;
+
+            // ロック済みなら、数フレーム置いてから確定値を読み取る
+            if (_lockFramesLeft > 0)
+            {
+                _lockFramesLeft--;
+                if (_lockFramesLeft == 0)
+                {
+                    ReadStageResults(now);
+                }
+                return;
+            }
 
             bool allNonZero = true;
             bool stable = true;
@@ -172,7 +193,7 @@ namespace Paratap.KemoLegAim.Editor
                 _stableCount++;
                 if (_stableCount >= 3)
                 {
-                    CompleteStage(now);
+                    LockStage();
                     return;
                 }
             }
@@ -181,20 +202,13 @@ namespace Paratap.KemoLegAim.Editor
                 _stableCount = 0;
             }
 
-            // 受動的な再計算が起きない場合の保険: エディタ文脈での Activate を試す。
-            // ただしロック後に値が (0,0,0) のままなら、その段階は失敗として扱う
-            // （CompleteStage は allNonZero を要求するため、ゼロのまま確定はしない）。
-            if (!_activateTriedInStage && stageElapsed > ActivateTrySeconds)
+            // 受動的な再計算が起きない場合の保険: 時間切れ前にロック自体を試す。
+            // ロック後に値が (0,0,0) のままなら、その段階は失敗として扱う。
+            if (stageElapsed > ActivateTrySeconds)
             {
-                _activateTriedInStage = true;
-                Debug.Log($"[KemoLegAim] 段階 {_stageIndex + 1}: ActivateConstraint によるキャプチャを試します。");
-                foreach (var c in stage)
-                {
-                    c.Constraint.ApplyConfigurationChanges();
-                    c.Constraint.ActivateConstraint();
-                }
-                _lastOffsets.Clear();
-                _stableCount = 0;
+                Debug.Log($"[KemoLegAim] 段階 {_stageIndex + 1}: 再計算が確認できないため、ActivateConstraint による確定を試します。");
+                LockStage();
+                return;
             }
 
             if (stageElapsed > StageTimeoutSeconds)
@@ -207,23 +221,45 @@ namespace Paratap.KemoLegAim.Editor
         }
 
         /// <summary>
-        /// 現段階の値を読み取り、その Constraint 群をロックして駆動を開始する。
-        /// 次段階の再計算は、この駆動状態の下で行われる（手動セットアップと同じ条件）。
+        /// 現段階の Constraint 群をロックする。読み取りはロックの数フレーム後に
+        /// ReadStageResults で行う（Activate のタイミングで値が確定し直す
+        /// 可能性があるため、ロック前の再計算値は採用しない）。
         /// </summary>
-        private static void CompleteStage(double now)
+        private static void LockStage()
         {
             var stage = CurrentStage;
+            foreach (var c in stage)
+            {
+                c.Constraint.ApplyConfigurationChanges();
+                c.Constraint.ActivateConstraint();
+            }
+            _lockFramesLeft = LockSettleFrames;
+            Debug.Log($"[KemoLegAim] 段階 {_stageIndex + 1}（{BoneAutoDetector.PartLabel(stage[0].Part)}）をロックしました。確定値を読み直します。");
+        }
+
+        private static void ReadStageResults(double now)
+        {
+            var stage = CurrentStage;
+
+            bool anyZero = false;
+            foreach (var c in stage)
+            {
+                if (c.Constraint.RotationOffset == Vector3.zero) anyZero = true;
+            }
+            if (anyZero)
+            {
+                Fail($"段階 {_stageIndex + 1}（{BoneAutoDetector.PartLabel(stage[0].Part)}）の Offset が" +
+                     "ロック後も (0,0,0) でした。エディタ上で Constraint が実行されていない可能性があります。" +
+                     "SDK Control Panel の「Execute VRChat Constraints in Edit Mode」を確認してください。");
+                return;
+            }
+
             foreach (var c in stage)
             {
                 _results[(c.Side, c.Part)] = (c.Constraint.RotationAtRest, c.Constraint.RotationOffset);
                 Debug.Log(
                     $"[KemoLegAim] 段階 {_stageIndex + 1} 確定: {BoneAutoDetector.SideLabel(c.Side)} {BoneAutoDetector.PartLabel(c.Part)} " +
                     $"At Rest = {c.Constraint.RotationAtRest}, Offset = {c.Constraint.RotationOffset}");
-                if (!_activateTriedInStage)
-                {
-                    c.Constraint.ApplyConfigurationChanges();
-                    c.Constraint.ActivateConstraint();
-                }
             }
 
             _stageIndex++;
@@ -236,7 +272,7 @@ namespace Paratap.KemoLegAim.Editor
             // 次段階の追跡をリセット（上位が駆動し始めたことで値は動き出す）
             _lastOffsets.Clear();
             _stableCount = 0;
-            _activateTriedInStage = false;
+            _lockFramesLeft = -1;
             _stageStartTime = now;
             _lastLogTime = now;
         }
@@ -291,7 +327,7 @@ namespace Paratap.KemoLegAim.Editor
             _sourceSetup = null;
             _lastOffsets = null;
             _stableCount = 0;
-            _activateTriedInStage = false;
+            _lockFramesLeft = -1;
         }
     }
 }
