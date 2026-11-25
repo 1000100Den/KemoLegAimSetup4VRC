@@ -1,0 +1,1 @@
+{"author":{"name":"Paratap"},"description":"VRChatアバターの鳥脚（獣脚）型の足を VRC Aim Constraint で実装する手順を、NDMF で非破壊に自動化する試作パッケージ。","displayName":"KemoLeg Aim Setup (Prototype)","legacyFiles":{},"legacyFolders":{},"name":"jp.paratap.kemoleg-aim","unity":"2022.3","version":"0.2.0","vpmDependencies":{"com.vrchat.avatars":">=3.10.6","nadena.dev.ndmf":">=1.10.0 <2.0.0"}}
