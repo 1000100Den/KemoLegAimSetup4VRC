@@ -109,6 +109,9 @@ namespace Paratap.KemoLegAim.Editor
                 MessageType.Info);
 
             EditorGUILayout.Space();
+            DrawCaptureSection();
+
+            EditorGUILayout.Space();
             EditorGUILayout.LabelField("ターゲット名", EditorStyles.boldLabel);
             DrawTextField("TargetNameUpperLeft", "左 UpperLeg");
             DrawTextField("TargetNameLowerLeft", "左 LowerLeg");
@@ -154,6 +157,55 @@ namespace Paratap.KemoLegAim.Editor
         {
             var prop = serializedObject.FindProperty(propertyPath);
             if (prop != null) EditorGUILayout.PropertyField(prop, new GUIContent(label));
+        }
+
+        // ---- At Rest / Offset キャプチャ（v0.4.0） ----
+        private void DrawCaptureSection()
+        {
+            EditorGUILayout.LabelField("At Rest / Offset キャプチャ", EditorStyles.boldLabel);
+
+            if (_setup.OffsetsCaptured)
+            {
+                if (_setup.CapturedPositionsMatch())
+                {
+                    EditorGUILayout.HelpBox(
+                        "キャプチャ済みです。ビルド時はキャプチャ値が使われます。",
+                        MessageType.Info);
+                }
+                else
+                {
+                    EditorGUILayout.HelpBox(
+                        "キャプチャ済みですが、ターゲット位置がキャプチャ時点から変更されています。" +
+                        "再キャプチャを推奨します。",
+                        MessageType.Warning);
+                }
+            }
+            else
+            {
+                EditorGUILayout.HelpBox(
+                    "未キャプチャです。このままでもビルドはできますが、At Rest / Offset は" +
+                    "計算値で代用され、姿勢が厳密には一致しません。",
+                    MessageType.Warning);
+            }
+
+            using (new EditorGUI.DisabledScope(KemoLegAimCapture.IsRunning))
+            {
+                if (GUILayout.Button(KemoLegAimCapture.IsRunning ? "キャプチャ中…" : "At Rest / Offset をキャプチャ"))
+                {
+                    KemoLegAimCapture.Begin(_setup);
+                }
+            }
+            if (!string.IsNullOrEmpty(KemoLegAimCapture.LastMessage))
+            {
+                EditorGUILayout.HelpBox(
+                    KemoLegAimCapture.LastMessage,
+                    KemoLegAimCapture.LastSucceeded ? MessageType.Info : MessageType.Warning);
+            }
+            EditorGUILayout.HelpBox(
+                "アバターの一時クローン上で、手動セットアップと同じ「未ロックの Constraint が" +
+                "エディタ上で再計算する」過程を再現し、確定した値を保存します。" +
+                "SDK Control Panel の「Execute VRChat Constraints in Edit Mode」を有効にしてください。",
+                MessageType.Info);
         }
 
         // ---- Humanoid チェック結果（仕様 §8） ----

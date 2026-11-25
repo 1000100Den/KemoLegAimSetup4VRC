@@ -95,6 +95,36 @@ namespace Paratap.KemoLegAim
         // （再生成は Inspector の「初期値を再計算」ボタンでのみ行う）。
         public bool TargetPositionsInitialized;
 
+        // ---- キャプチャ済み At Rest / Offset（v0.4.0） ----
+        // VRCAimConstraint の RotationAtRest / RotationOffset は、ビルド時に
+        // ActivateConstraint() を呼んでもキャプチャされない（v0.3.0 で実測）。
+        // 手動セットアップでは、未ロックの Constraint がエディタ上で再計算を
+        // 繰り返すことで値が決まる。そこで Editor 側のキャプチャ機能
+        // （KemoLegAimCapture）が一時クローン上でその再計算を行わせ、結果を
+        // ここへ保存する。ビルド時はこの値をそのまま設定する。
+        // ターゲット位置やボーン割り当てを変更したら再キャプチャが必要。
+        public Vector3 CapturedAtRestUpperLeft;
+        public Vector3 CapturedAtRestLowerLeft;
+        public Vector3 CapturedAtRestFootLeft;
+        public Vector3 CapturedAtRestUpperRight;
+        public Vector3 CapturedAtRestLowerRight;
+        public Vector3 CapturedAtRestFootRight;
+        public Vector3 CapturedOffsetUpperLeft;
+        public Vector3 CapturedOffsetLowerLeft;
+        public Vector3 CapturedOffsetFootLeft;
+        public Vector3 CapturedOffsetUpperRight;
+        public Vector3 CapturedOffsetLowerRight;
+        public Vector3 CapturedOffsetFootRight;
+        public bool OffsetsCaptured;
+
+        // キャプチャ時点のターゲット位置スナップショット（陳腐化検出用）。
+        public Vector3 CapturedTargetPositionUpperLeft;
+        public Vector3 CapturedTargetPositionLowerLeft;
+        public Vector3 CapturedTargetPositionFootLeft;
+        public Vector3 CapturedTargetPositionUpperRight;
+        public Vector3 CapturedTargetPositionLowerRight;
+        public Vector3 CapturedTargetPositionFootRight;
+
         // ---- 生成されるターゲット名（仕様 §6） ----
         // コンポーネントのアタッチ時（Reset）および自動検出・再生成ボタンで生成される。
         public string TargetNameUpperLeft;
@@ -153,6 +183,102 @@ namespace Paratap.KemoLegAim
                     case LegPart.Foot: TargetPositionFootRight = localPosition; break;
                 }
             }
+        }
+
+        public Vector3 GetCapturedAtRest(LegSide side, LegPart part)
+        {
+            if (side == LegSide.Left)
+            {
+                switch (part)
+                {
+                    case LegPart.UpperLeg: return CapturedAtRestUpperLeft;
+                    case LegPart.LowerLeg: return CapturedAtRestLowerLeft;
+                    case LegPart.Foot: return CapturedAtRestFootLeft;
+                }
+            }
+            else
+            {
+                switch (part)
+                {
+                    case LegPart.UpperLeg: return CapturedAtRestUpperRight;
+                    case LegPart.LowerLeg: return CapturedAtRestLowerRight;
+                    case LegPart.Foot: return CapturedAtRestFootRight;
+                }
+            }
+            return Vector3.zero;
+        }
+
+        public Vector3 GetCapturedOffset(LegSide side, LegPart part)
+        {
+            if (side == LegSide.Left)
+            {
+                switch (part)
+                {
+                    case LegPart.UpperLeg: return CapturedOffsetUpperLeft;
+                    case LegPart.LowerLeg: return CapturedOffsetLowerLeft;
+                    case LegPart.Foot: return CapturedOffsetFootLeft;
+                }
+            }
+            else
+            {
+                switch (part)
+                {
+                    case LegPart.UpperLeg: return CapturedOffsetUpperRight;
+                    case LegPart.LowerLeg: return CapturedOffsetLowerRight;
+                    case LegPart.Foot: return CapturedOffsetFootRight;
+                }
+            }
+            return Vector3.zero;
+        }
+
+        public void SetCaptured(LegSide side, LegPart part, Vector3 atRest, Vector3 offset)
+        {
+            if (side == LegSide.Left)
+            {
+                switch (part)
+                {
+                    case LegPart.UpperLeg: CapturedAtRestUpperLeft = atRest; CapturedOffsetUpperLeft = offset; break;
+                    case LegPart.LowerLeg: CapturedAtRestLowerLeft = atRest; CapturedOffsetLowerLeft = offset; break;
+                    case LegPart.Foot: CapturedAtRestFootLeft = atRest; CapturedOffsetFootLeft = offset; break;
+                }
+            }
+            else
+            {
+                switch (part)
+                {
+                    case LegPart.UpperLeg: CapturedAtRestUpperRight = atRest; CapturedOffsetUpperRight = offset; break;
+                    case LegPart.LowerLeg: CapturedAtRestLowerRight = atRest; CapturedOffsetLowerRight = offset; break;
+                    case LegPart.Foot: CapturedAtRestFootRight = atRest; CapturedOffsetFootRight = offset; break;
+                }
+            }
+        }
+
+        /// <summary>
+        /// 現在のターゲット位置をキャプチャ時点のスナップショットとして保存する。
+        /// キャプチャ完了時に Editor 側から呼ばれる。
+        /// </summary>
+        public void SnapshotTargetPositionsForCapture()
+        {
+            CapturedTargetPositionUpperLeft = TargetPositionUpperLeft;
+            CapturedTargetPositionLowerLeft = TargetPositionLowerLeft;
+            CapturedTargetPositionFootLeft = TargetPositionFootLeft;
+            CapturedTargetPositionUpperRight = TargetPositionUpperRight;
+            CapturedTargetPositionLowerRight = TargetPositionLowerRight;
+            CapturedTargetPositionFootRight = TargetPositionFootRight;
+        }
+
+        /// <summary>
+        /// 現在のターゲット位置がキャプチャ時点と一致するか。
+        /// false の場合、キャプチャ済み At Rest / Offset は古い可能性がある。
+        /// </summary>
+        public bool CapturedPositionsMatch()
+        {
+            return CapturedTargetPositionUpperLeft == TargetPositionUpperLeft
+                && CapturedTargetPositionLowerLeft == TargetPositionLowerLeft
+                && CapturedTargetPositionFootLeft == TargetPositionFootLeft
+                && CapturedTargetPositionUpperRight == TargetPositionUpperRight
+                && CapturedTargetPositionLowerRight == TargetPositionLowerRight
+                && CapturedTargetPositionFootRight == TargetPositionFootRight;
         }
 
         public string GetTargetName(LegSide side, LegPart part)

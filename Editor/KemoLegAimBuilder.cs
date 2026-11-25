@@ -1,10 +1,24 @@
 using System;
+using System.Collections.Generic;
 using UnityEngine;
 using VRC.Dynamics;
 using VRC.SDK3.Dynamics.Constraint.Components;
 
 namespace Paratap.KemoLegAim.Editor
 {
+    /// <summary>
+    /// 生成したターゲットと Constraint の組（部位ごと）。
+    /// </summary>
+    public class CreatedConstraint
+    {
+        public VRCAimConstraint Constraint;
+        public LegSide Side;
+        public LegPart Part;
+        public Transform DummyBone;
+        public Transform Target;
+        public Transform Hips;
+    }
+
     /// <summary>
     /// NDMF ビルド時にクローン側へセットアップを適用する本体（仕様 §3 / §4、v1.1 付記A / B）。
     /// - ターゲット用空オブジェクトを生成し、1つ下の関節側のトラッキングボーンの子にする
@@ -14,12 +28,45 @@ namespace Paratap.KemoLegAim.Editor
     /// - ダミー側 Upper/Lower/Foot（左右計6）に VRCAimConstraint を付与・設定・有効化する
     /// setup のフィールド参照はクローン側の Transform を指している
     /// （NDMF はアバターを複製してからパスを実行するため、参照も複製側に解決される）。
+    ///
+    /// At Rest / Offset の扱い（v0.4.0）:
+    /// ActivateConstraint() はビルド文脈では Offset をキャプチャしない
+    /// （v0.3.0 で実測。現在のオフセット＝既定値 (0,0,0) を維持してロックするだけ）。
+    /// 手動セットアップで値が決まるのは、未ロックの Constraint がエディタ上で
+    /// 再計算を繰り返すため。そこで正規ルートは Editor 側の事前キャプチャ
+    /// （KemoLegAimCapture が一時クローン上で再計算させて setup へ保存）とし、
+    /// ビルド時は保存値をそのまま設定する。未キャプチャの場合は v0.3.0 の
+    /// 計算値フォールバックで代用する（姿勢は近似になる）。
     /// </summary>
     public static class KemoLegAimBuilder
     {
         public static void Apply(KemoLegAimSetup setup)
         {
             if (setup == null) return;
+
+            if (setup.OffsetsCaptured && !setup.CapturedPositionsMatch())
+            {
+                Debug.LogWarning(
+                    "[KemoLegAim] ターゲット位置がキャプチャ時点から変更されています。" +
+                    "At Rest / Offset が古い可能性があるため、Inspector で再キャプチャしてください。", setup);
+            }
+
+            var created = CreateAll(setup);
+            foreach (var c in created)
+            {
+                FinalizeConstraint(setup, c);
+            }
+        }
+
+        /// <summary>
+        /// ターゲット生成と Constraint の付与・基本設定までを行い、
+        /// At Rest / Offset は未確定（既定値）のまま返す。
+        /// ビルド時の Apply と、Editor 側キャプチャ（KemoLegAimCapture）の両方から使う。
+        /// </summary>
+        public static List<CreatedConstraint> CreateAll(KemoLegAimSetup setup)
+        {
+            var result = new List<CreatedConstraint>();
+            if (setup == null) return result;
 
             var animator = BoneAutoDetector.FindAnimator(setup);
 
@@ -76,7 +123,7 @@ namespace Paratap.KemoLegAim.Editor
                     target.transform.localRotation = Quaternion.identity;
                     target.transform.localScale = Vector3.one;
 
-                    // ---- VRC Aim Constraint 付与・設定 ----
+                    // ---- VRC Aim Constraint 付与・基本設定 ----
                     var constraint = dummyBone.gameObject.AddComponent<VRCAimConstraint>();
                     constraint.WorldUp = VRCConstraintBase.WorldUpType.ObjectUp;
                     if (hips != null) constraint.WorldUpTransform = hips;
@@ -97,34 +144,57 @@ namespace Paratap.KemoLegAim.Editor
                     constraint.Sources.Add(new VRCConstraintSource(target.transform, 1.0f));
 #endif
 
-                    // ---- At Rest / Offset の確定（v0.3.0）----
-                    // v0.2.0 ではクローン側の RotationAtRest / RotationOffset が
-                    // (0,0,0) のまま固定され、Play で姿勢が崩れた（2026-11-26 実測）。
-                    // 原因の見立て: ActivateConstraint() のキャプチャは「適用済みの」
-                    // 構成（Source 等）を前提とするが、v0.2.0 は ApplyConfigurationChanges()
-                    // より前に呼んでいたため、Source 未適用の状態でキャプチャされ
-                    // 既定値のままになった。
-                    // 対策:
-                    // 1) RotationAtRest は定義どおり「Weight 0 のときのローカル回転」
-                    //    なので、レストポーズのボーンのローカル回転を明示設定する。
-                    // 2) 順序を ApplyConfigurationChanges() → ActivateConstraint() に変更し、
-                    //    Source が適用された状態で Offset をキャプチャさせる。
-                    // 3) それでも Offset が (0,0,0) のままなら、自前計算した値で補う。
-                    constraint.RotationAtRest = dummyBone.localRotation.eulerAngles;
                     constraint.ApplyConfigurationChanges();
-                    constraint.ActivateConstraint();
 
-                    if (constraint.RotationOffset == Vector3.zero)
+                    result.Add(new CreatedConstraint
                     {
-                        constraint.RotationOffset = ComputeAimOffset(
-                            dummyBone, target.transform,
-                            constraint.AimAxis, constraint.UpAxis, hips).eulerAngles;
-                        constraint.ApplyConfigurationChanges();
-                        Debug.LogWarning(
-                            $"[KemoLegAim] {BoneAutoDetector.SideLabel(side)} {BoneAutoDetector.PartLabel(part)}: " +
-                            "ActivateConstraint で RotationOffset がキャプチャされなかったため、計算値で補いました。", setup);
-                    }
+                        Constraint = constraint,
+                        Side = side,
+                        Part = part,
+                        DummyBone = dummyBone,
+                        Target = target.transform,
+                        Hips = hips
+                    });
                 }
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// At Rest / Offset を確定し、有効化＋ロックする（ビルド時専用）。
+        /// キャプチャ済みなら保存値を、未キャプチャなら計算値フォールバックを使う。
+        /// </summary>
+        private static void FinalizeConstraint(KemoLegAimSetup setup, CreatedConstraint c)
+        {
+            var constraint = c.Constraint;
+
+            if (setup.OffsetsCaptured)
+            {
+                constraint.RotationAtRest = setup.GetCapturedAtRest(c.Side, c.Part);
+                constraint.RotationOffset = setup.GetCapturedOffset(c.Side, c.Part);
+                constraint.ApplyConfigurationChanges();
+                constraint.ActivateConstraint();
+                return;
+            }
+
+            // 未キャプチャ時のフォールバック（v0.3.0 方式）:
+            // At Rest は定義どおりボーンのローカル回転。Offset は Activate で
+            // キャプチャされないため、レストポーズの変換から計算した値で補う。
+            // 計算値は SDK ソルバの合成と完全には一致せず、姿勢は近似になる。
+            constraint.RotationAtRest = c.DummyBone.localRotation.eulerAngles;
+            constraint.ApplyConfigurationChanges();
+            constraint.ActivateConstraint();
+
+            if (constraint.RotationOffset == Vector3.zero)
+            {
+                constraint.RotationOffset = ComputeAimOffset(
+                    c.DummyBone, c.Target,
+                    constraint.AimAxis, constraint.UpAxis, c.Hips).eulerAngles;
+                constraint.ApplyConfigurationChanges();
+                Debug.LogWarning(
+                    $"[KemoLegAim] {BoneAutoDetector.SideLabel(c.Side)} {BoneAutoDetector.PartLabel(c.Part)}: " +
+                    "At Rest / Offset が未キャプチャのため計算値で補いました。" +
+                    "厳密な一致には Inspector での事前キャプチャを実行してください。", setup);
             }
         }
 
@@ -137,6 +207,8 @@ namespace Paratap.KemoLegAim.Editor
         /// （ObjectUp の場合は Hips の up）に合う回転として LookRotation で構成する。
         /// AimAxis と UpAxis が平行な部位（LowerLeg）では基準基底が定まらないため、
         /// UpAxis と平行でない軸を代用する（この場合のロール方向は近似になる）。
+        /// 実測では手動セットアップの Offset と数十度単位でずれることが分かっており、
+        /// あくまで未キャプチャ時の代用である。
         /// </summary>
         private static Quaternion ComputeAimOffset(Transform bone, Transform target, Vector3 aimAxis, Vector3 upAxis, Transform worldUpObject)
         {
